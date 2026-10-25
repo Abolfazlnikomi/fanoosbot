@@ -12,10 +12,10 @@
 - پشتیبانی/تیکت با ارسال پیام به همه ادمین‌ها و پاسخ ادمین
 - پروفایل کاربر، آمار ادمین، ارسال همگانی با تأیید و گزارش
 - خوش‌آمدگویی فقط یک‌بار (بعد از آن ناوبری بدون سلام)
-- فقط کتابخانه requests + کتابخانه استاندارد پایتون
+- PostgreSQL، احراز هویت اجباری و مدیریت کاربران با اکسل
 
 روش اجرا:
-  pip install requests
+  pip install -r requirements.txt
   python bot.py
 دستورها: /start ، /id ، /admin ، /help
 """
@@ -24,18 +24,18 @@ import os
 import re
 import json
 import time
-import sqlite3
-import traceback
+import psycopg
+import identity
+from database import Connection
 import datetime
 from urllib.parse import urlparse, parse_qs
 
 import requests
 
 # ================== تنظیمات اصلی ==================
-TOKEN = "1518094453:YfPVh7dOISdTIr-LhsdHhsSb7R-IbiN9abY" 
+TOKEN = os.environ.get("BALE_TOKEN", "")
 
-OWNER_ID = 1891614962              # شناسه مالک (همیشه ادمین است و حذف نمی‌شود)
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)) or ".", "bot.db")
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 API = "https://tapi.bale.ai/bot{}/{}"
 
 DEFAULT_SETTINGS = {
@@ -69,10 +69,10 @@ def api(method, retries=2, **payload):
             try:
                 return r.json()
             except ValueError:
-                print(f"[خطا] پاسخ غیر JSON از {method}: {r.status_code} {r.text[:200]}")
+                print(f"[خطا] پاسخ غیر JSON از {method}: {r.status_code}")
                 return {"ok": False, "description": "bad json"}
-        except requests.RequestException as e:
-            print(f"[خطای شبکه] {method} تلاش {attempt + 1}: {e}")
+        except requests.RequestException:
+            print(f"[خطای شبکه] {method} تلاش {attempt + 1}")
             time.sleep(1 + attempt)
     return {"ok": False, "description": "network error"}
 
@@ -116,9 +116,7 @@ def make_keyboard(buttons, row_width=None):
 # ================== دیتابیس ==================
 def db():
     """اتصال جدید به دیتابیس."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return Connection()
 
 def q(sql, params=(), fetch="none"):
     """اجرای کوئری ساده با اتصال خودکار."""
@@ -126,11 +124,13 @@ def q(sql, params=(), fetch="none"):
     try:
         cur = conn.execute(sql, params)
         if fetch == "one":
-            return cur.fetchone()
-        if fetch == "all":
-            return cur.fetchall()
+            result = cur.fetchone()
+        elif fetch == "all":
+            result = cur.fetchall()
+        else:
+            result = None
         conn.commit()
-        return None
+        return result
     finally:
         conn.close()
 
@@ -212,10 +212,8 @@ def init_db():
         created_at TEXT,
         status TEXT DEFAULT 'open');
     """)
-    columns = {column[1] for column in c.execute("PRAGMA table_info(sections)")}
     for column, kind in (("forward_chat_id", "TEXT"), ("forward_message_id", "INTEGER")):
-        if column not in columns:
-            c.execute(f"ALTER TABLE sections ADD COLUMN {column} {kind}")
+        c.execute(f"ALTER TABLE sections ADD COLUMN IF NOT EXISTS {column} {kind}")
     # تنظیمات پیش‌فرض
     for k, v in DEFAULT_SETTINGS.items():
         c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)", (k, v))
@@ -230,6 +228,7 @@ def init_db():
                       (None, t, txt, i, time.strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
+    identity.initialize()
 
 # ================== تنظیمات ==================
 def get_setting(key, default=""):
@@ -255,7 +254,7 @@ def register_user(chat_id, first_name):
     row = q("SELECT 1 FROM users WHERE chat_id=?", (chat_id,), "one")
     if row:
         return False
-    q("INSERT INTO users(chat_id, first_name, joined_at, greeted) VALUES(?,?,?,0)",
+    q("INSERT OR IGNORE INTO users(chat_id, first_name, joined_at, greeted) VALUES(?,?,?,0)",
       (chat_id, first_name or "دوست من", now_str()))
     return True
 
@@ -265,6 +264,153 @@ def is_admin(chat_id):
 
 def is_owner(chat_id):
     return chat_id == OWNER_ID
+
+
+def has_access(chat_id):
+    return is_admin(chat_id) or bool(identity.lookup(chat_id))
+
+
+def authorized_targets():
+    return [row[0] for row in q("""SELECT bale_id FROM authorized_users
+        WHERE active AND bale_id IS NOT NULL UNION SELECT chat_id FROM admins""", fetch="all")]
+
+
+def send_workbook(chat_id, content, filename):
+    if not is_admin(chat_id):
+        return
+    try:
+        response = requests.post(API.format(TOKEN, "sendDocument"), data={"chat_id": chat_id},
+            files={"document": (filename, content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            timeout=60)
+        response.raise_for_status()
+        if not response.json().get("ok"):
+            raise ValueError("upload failed")
+    except (requests.RequestException, ValueError):
+        send_message(chat_id, "ارسال فایل ناموفق بود؛ دوباره تلاش کنید.")
+
+
+def handle_identity_callback(chat_id, data):
+    if not is_admin(chat_id):
+        return
+    STATES.pop(chat_id, None)
+    if data == "a:identity:template":
+        send_workbook(chat_id, identity.workbook_bytes(), "users-template.xlsx")
+    elif data == "a:identity:export":
+        send_workbook(chat_id, identity.export_users(), "authorized-users.xlsx")
+    elif data == "a:identity:upload":
+        STATES[chat_id] = ["identity_upload", None]
+        send_message(chat_id, "فایل xlsx تکمیل‌شده را ارسال کنید (حداکثر ۵ مگابایت). انصراف: /cancel")
+    elif data == "a:identity:reports":
+        rows = q("""SELECT created_at, inserted, updated FROM identity_imports
+            ORDER BY id DESC LIMIT 10""", fetch="all")
+        send_message(chat_id, "\n".join(f"{date}: ثبت {inserted}، به‌روزرسانی {updated}، خطا ۰"
+                                      for date, inserted, updated in rows) or "گزارشی ثبت نشده است.")
+    else:
+        send_message(chat_id, "احراز هویت و مدیریت کاربران", make_keyboard([
+            ("دانلود قالب اکسل", "a:identity:template"),
+            ("دانلود کاربران فعلی", "a:identity:export"),
+            ("بارگذاری اکسل", "a:identity:upload"),
+            ("گزارش بارگذاری‌ها", "a:identity:reports"),
+            ("بازگشت", "a:panel"),
+        ]))
+
+
+def receive_identity_file(chat_id, document):
+    if not is_admin(chat_id):
+        return
+    if not document.get("file_name", "").lower().endswith(".xlsx"):
+        send_message(chat_id, "فقط فایل xlsx مطابق قالب ارسال کنید.")
+        return
+    if document.get("file_size", 0) > identity.MAX_FILE_SIZE:
+        send_message(chat_id, "حجم فایل بیش از ۵ مگابایت است.")
+        return
+    try:
+        metadata = api("getFile", file_id=document["file_id"])
+        if not metadata.get("ok"):
+            raise ValueError("download failed")
+        file_path = metadata["result"]["file_path"]
+        if not isinstance(file_path, str) or file_path.startswith(("/", "http")) or ".." in file_path:
+            raise ValueError("invalid path")
+        content = bytearray()
+        with requests.get(f"https://tapi.bale.ai/file/bot{TOKEN}/{file_path}",
+                          stream=True, timeout=60, allow_redirects=False) as response:
+            response.raise_for_status()
+            for chunk in response.iter_content(65536):
+                content.extend(chunk)
+                if len(content) > identity.MAX_FILE_SIZE:
+                    raise identity.ValidationError(["حجم فایل بیش از حد مجاز است."], 1)
+        state = STATES.get(chat_id)
+        discount_section = state[1] if state and state[0] == "discount_upload" else None
+        if discount_section is not None:
+            inserted, updated = identity.import_discounts(bytes(content), discount_section)
+        else:
+            inserted, updated = identity.import_users(bytes(content), chat_id)
+    except identity.ValidationError as error:
+        send_message(chat_id, f"ثبت: ۰ | به‌روزرسانی: ۰ | ردیف دارای خطا: {error.count}\n"
+                     "هیچ تغییری ثبت نشد.\n" + str(error))
+    except Exception:
+        send_message(chat_id, "دریافت یا ثبت فایل ناموفق بود؛ هیچ تغییری ثبت نشد. دوباره تلاش کنید.")
+    else:
+        STATES.pop(chat_id, None)
+        send_message(chat_id, f"ثبت: {inserted} | به‌روزرسانی: {updated} | خطا: ۰")
+
+
+def discounts_admin_panel(chat_id, section_id=None):
+    if not is_admin(chat_id):
+        return
+    sections = identity.discount_sections(include_inactive=True)
+    if section_id is None:
+        buttons = [(title + (" (غیرفعال)" if not active else ""), f"a:discounts:open:{identifier}")
+                   for identifier, title, active in sections]
+        buttons += [("ایجاد بخش تخفیف", "a:discounts:add"), ("بازگشت", "a:panel")]
+        send_message(chat_id, "مدیریت بخش‌های تخفیف", make_keyboard(buttons))
+        return
+    section = next((row for row in sections if row[0] == section_id), None)
+    if not section:
+        send_message(chat_id, "بخش تخفیف یافت نشد.")
+        return
+    send_message(chat_id, section[1], make_keyboard([
+        ("تغییر نام نمایشی", f"a:discounts:rename:{section_id}"),
+        ("غیرفعال کردن" if section[2] else "فعال کردن", f"a:discounts:toggle:{section_id}"),
+        ("دانلود قالب کدها", f"a:discounts:template:{section_id}"),
+        ("دانلود کدهای فعلی", f"a:discounts:export:{section_id}"),
+        ("بارگذاری کدهای این بخش", f"a:discounts:upload:{section_id}"),
+        ("بازگشت", "a:discounts"),
+    ]))
+
+
+def handle_discounts_callback(chat_id, data):
+    if not is_admin(chat_id):
+        return
+    STATES.pop(chat_id, None)
+    parts = data.split(":")
+    action = parts[2] if len(parts) > 2 else ""
+    if action == "add":
+        STATES[chat_id] = ["discount_add", None]
+        send_message(chat_id, "نام بخش تخفیف جدید را ارسال کنید. انصراف: /cancel")
+        return
+    if len(parts) != 4 or not parts[3].isdigit():
+        discounts_admin_panel(chat_id)
+        return
+    section_id = int(parts[3])
+    if not any(row[0] == section_id for row in identity.discount_sections(include_inactive=True)):
+        send_message(chat_id, "بخش تخفیف یافت نشد.")
+        return
+    if action == "rename":
+        STATES[chat_id] = ["discount_rename", section_id]
+        send_message(chat_id, "نام نمایشی جدید را ارسال کنید. انصراف: /cancel")
+    elif action == "toggle":
+        identity.toggle_discount_section(section_id)
+        discounts_admin_panel(chat_id, section_id)
+    elif action == "template":
+        send_workbook(chat_id, identity.workbook_bytes(headers=identity.DISCOUNT_HEADERS), "discount-template.xlsx")
+    elif action == "export":
+        send_workbook(chat_id, identity.export_discounts(section_id), f"discount-{section_id}.xlsx")
+    elif action == "upload":
+        STATES[chat_id] = ["discount_upload", section_id]
+        send_message(chat_id, "فایل xlsx دو ستونی کد ملی و کد تخفیف اختصاصی این بخش را بفرستید. انصراف: /cancel")
+    else:
+        discounts_admin_panel(chat_id, section_id)
 
 def get_admins():
     return q("SELECT chat_id, name FROM admins ORDER BY chat_id", fetch="all")
@@ -439,6 +585,7 @@ def show_menu(chat_id, message_id=None, greet=False, name=None):
         ("👤 پروفایل من", "profile"),
     ]
     btns = [button for button in btns if button[1] not in FEATURES or get_setting("feature_" + button[1], "1") == "1"]
+    btns += [(title, f"discount:{identifier}") for identifier, title, active in identity.discount_sections()]
     if is_admin(chat_id):
         btns.append(("🛠 پنل مدیریت", "a:panel"))
     kb = make_keyboard(btns)
@@ -471,6 +618,8 @@ def admin_panel(chat_id):
         ("🎫 تیکت‌ها", "a:tickets"), ("📊 آمار", "a:stats"),
         ("👥 ادمین‌ها", "a:admins"), ("⚙️ تنظیمات", "a:settings"),
         ("🟢 فعال / غیرفعال کردن امکانات", "a:features"),
+        ("احراز هویت و مدیریت کاربران", "a:identity"),
+        ("مدیریت بخش‌های تخفیف", "a:discounts"),
         ("🏠 منوی اصلی", "menu"),
     ])
     send_message(chat_id, "🛠 پنل مدیریت مدرسه فانوس\nیک گزینه انتخاب کن:", kb)
@@ -705,7 +854,7 @@ def cast_vote(chat_id, option_id):
           (poll_id, chat_id, option_id))
         q("UPDATE poll_options SET votes=votes+1 WHERE id=?", (option_id,))
         answer_callback_answer = "رأی تو ثبت شد! ✅"
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
         answer_callback_answer = "شما قبلاً در این نظرسنجی رأی داده‌اید. ⚠️"
     show_poll(chat_id, poll_id)
     return answer_callback_answer
@@ -900,7 +1049,7 @@ def do_broadcast(chat_id):
     if to_admins:
         targets = [c for c, _ in get_admins()]
     else:
-        targets = [r[0] for r in q("SELECT chat_id FROM users", fetch="all")]
+        targets = authorized_targets()
     ok = fail = 0
     for uid in targets:
         r = send_message(uid, text)
@@ -916,7 +1065,7 @@ def send_reminder():
     """یادآوری رویدادهای ۷ روز آینده به همه کاربران."""
     rows = upcoming_events(7)
     text = "🔔 یادآوری برنامه هفته (۷ روز آینده)\n\n" + events_text(rows)
-    targets = [r[0] for r in q("SELECT chat_id FROM users", fetch="all")]
+    targets = authorized_targets()
     ok = fail = 0
     for uid in targets:
         if send_message(uid, text) and True:
@@ -929,6 +1078,11 @@ def send_reminder():
 # ================== مسیریابی کلیک‌های شیشه‌ای ==================
 def handle_callback(chat_id, data, callback_id, message_id, first_name):
     """پردازش کلیک روی دکمه‌های شیشه‌ای با طرح کدهای کوتاه (<=64 بایت)."""
+    if not has_access(chat_id):
+        STATES.pop(chat_id, None)
+        answer_callback(callback_id, "لطفاً کد ملی خود را وارد کنید")
+        send_message(chat_id, "لطفاً کد ملی خود را وارد کنید")
+        return
     if ((data.startswith("a:") and data != "a:supmsg") or data.startswith(("g:afaq:", "rpl"))) and not is_admin(chat_id):
         answer_callback(callback_id, "⛔️ دسترسی ندارید.")
         return
@@ -940,6 +1094,21 @@ def handle_callback(chat_id, data, callback_id, message_id, first_name):
         answer_callback(callback_id, "کمی آهسته‌تر! ⏳")
         return
     answer_callback(callback_id)
+
+    if data == "discount" or data.startswith("discount:"):
+        section_id = None if data == "discount" else safe_int(data.split(":", 1)[1])
+        account = identity.personal_discount(chat_id, section_id) if data == "discount" or section_id is not None else None
+        if account is None:
+            send_message(chat_id, "این بخش تخفیف در دسترس نیست.")
+        else:
+            send_message(chat_id, f"{account[0]}\n{account[1]}" if account[1] else "برای حساب شما کد تخفیف ثبت نشده است")
+        return
+    if data == "a:discounts" or data.startswith("a:discounts:"):
+        handle_discounts_callback(chat_id, data)
+        return
+    if data.startswith("a:identity"):
+        handle_identity_callback(chat_id, data)
+        return
 
     # --- ناوبری منو ---
     if data == "menu":
@@ -1222,7 +1391,22 @@ def handle_state_message(chat_id, text, first_name):
         send_message(chat_id, "این بخش غیرفعال است.")
         return True
 
-    if state == "btext":  # متن همگانی → تأیید
+    if state in ("discount_add", "discount_rename"):
+        try:
+            if state == "discount_add":
+                section_id = identity.create_discount_section(text)
+            else:
+                section_id = temp
+                if not identity.rename_discount_section(section_id, text):
+                    send_message(chat_id, "بخش تخفیف یافت نشد.")
+                    STATES.pop(chat_id, None)
+                    return True
+        except ValueError as error:
+            send_message(chat_id, str(error))
+            return True
+        STATES.pop(chat_id, None)
+        discounts_admin_panel(chat_id, section_id)
+    elif state == "btext":  # متن همگانی → تأیید
         confirm_broadcast(chat_id, text, bool(temp))
     elif state == "bcast":
         pass  # فقط با دکمه تأیید ارسال می‌شود
@@ -1319,8 +1503,8 @@ def handle_state_message(chat_id, text, first_name):
             if len(opts) < 2:
                 send_message(chat_id, "⚠️ حداقل دو گزینه لازم است؛ گزینه بعدی را بفرست.")
             else:
-                q("INSERT INTO polls(question, created_at) VALUES(?,?)", (question, now_str()))
-                pid = q("SELECT MAX(id) FROM polls", fetch="one")[0]
+                pid = q("INSERT INTO polls(question, created_at) VALUES(?,?) RETURNING id",
+                        (question, now_str()), "one")[0]
                 for o in opts:
                     q("INSERT INTO poll_options(poll_id, text) VALUES(?,?)", (pid, o))
                 STATES.pop(chat_id, None)
@@ -1342,8 +1526,7 @@ def handle_state_message(chat_id, text, first_name):
             if len(opts) < 2 or cid == 0:
                 send_message(chat_id, "⚠️ حداقل ۲ گزینه و یک گزینه درست (با *) لازم است.")
             else:
-                q("INSERT INTO quiz_questions(text) VALUES(?)", (qtext,))
-                qid = q("SELECT MAX(id) FROM quiz_questions", fetch="one")[0]
+                qid = q("INSERT INTO quiz_questions(text) VALUES(?) RETURNING id", (qtext,), "one")[0]
                 for i, o in enumerate(opts):
                     q("INSERT INTO quiz_options(question_id, text, is_correct) VALUES(?,?,?)",
                       (qid, o, 1 if i == cid - 1 else 0))
@@ -1411,6 +1594,16 @@ def handle_state_message(chat_id, text, first_name):
 
 def handle_message(chat_id, text, first_name, message_id=None):
     """پردازش پیام‌ها: دستورها، حالت‌های ادمین، و پیش‌فرض (منو بدون سلام)."""
+    if not has_access(chat_id):
+        STATES.pop(chat_id, None)
+        if text.startswith("/"):
+            send_message(chat_id, "لطفاً کد ملی خود را وارد کنید")
+        elif identity.bind(chat_id, identity.normalize(text)):
+            register_user(chat_id, first_name)
+            show_menu(chat_id, greet=True, name=first_name)
+        else:
+            send_message(chat_id, "شما به این بات دسترسی ندارید")
+        return
     register_user(chat_id, first_name)
 
     if text == "/cancel":
@@ -1468,6 +1661,12 @@ def process_update(upd):
         if msg["chat"].get("type") != "private" or msg.get("from", {}).get("id") != chat_id:
             return
         state = STATES.get(chat_id)
+        if msg.get("document") and state and state[0] in ("identity_upload", "discount_upload") and is_admin(chat_id):
+            receive_identity_file(chat_id, msg["document"])
+            return
+        if not has_access(chat_id):
+            handle_message(chat_id, msg.get("text", "/start"), msg.get("from", {}).get("first_name", ""))
+            return
         if state and state[0] == "sec_editf" and is_admin(chat_id) and (msg.get("video") or msg.get("document") or msg.get("forward_from_chat") or msg.get("forward_origin")):
             save_section_forward(chat_id, state[1], chat_id, msg["message_id"])
             return
@@ -1485,11 +1684,12 @@ def startup_check():
         print(f"✅ اتصال برقرار شد. ربات: @{me.get('username', '?')} (id={me.get('id')})")
         return True
     print("❌ getMe ناموفق بود؛ توکن یا اتصال اینترنت را بررسی کنید.")
-    print(f"پاسخ سرور: {r}")
     return False
 
 def main():
     """نقطه شروع: ساخت دیتابیس + حلقه long-polling."""
+    if not TOKEN or OWNER_ID <= 0:
+        raise RuntimeError("Set BALE_TOKEN and OWNER_ID")
     init_db()
     if not startup_check():
         return
@@ -1504,14 +1704,14 @@ def main():
                     try:
                         process_update(upd)
                     except Exception:
-                        traceback.print_exc()  # خطای یک آپدیت، ربات را نمی‌بندد
+                        print("پردازش پیام ناموفق بود؛ اطلاعات حساس ثبت نشد.")
             else:
                 time.sleep(3)
         except KeyboardInterrupt:
             print("ربات متوقف شد. 👋")
             break
         except Exception:
-            traceback.print_exc()
+            print("خطای سرویس؛ تلاش مجدد بدون ثبت اطلاعات حساس.")
             time.sleep(3)
 
 if __name__ == "__main__":
