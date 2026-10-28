@@ -117,8 +117,7 @@ def is_admin_markup(markup):
 def make_keyboard(buttons, row_width=None):
     """ساخت کیبورد شیشه‌ای؛ buttons = [(متن, callback_data) یا (متن, callback_data, True) برای لینک]."""
     if row_width is None:
-        row_width = get_setting_int("buttons_per_row", 1)
-        row_width = max(1, min(4, row_width))
+        row_width = 1
     kb = []
     for i in range(0, len(buttons), row_width):
         row = []
@@ -613,7 +612,7 @@ def show_menu(chat_id, message_id=None, greet=False, name=None):
     btns += [(title, f"discount:{identifier}") for identifier, title, active in identity.discount_sections()]
     if is_admin(chat_id):
         btns.append(("🛠 پنل مدیریت", "a:panel"))
-    kb = make_keyboard(btns, row_width=2)
+    kb = make_keyboard(btns, row_width=1)
     if message_id:
         edit_message(chat_id, message_id, text, kb)
     else:

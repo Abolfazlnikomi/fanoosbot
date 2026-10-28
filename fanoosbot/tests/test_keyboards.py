@@ -38,6 +38,27 @@ class InlineKeyboardTests(unittest.TestCase):
         markup = bot.make_keyboard([("one", "s1"), ("two", "s2")], row_width=2)
         self.assertEqual(len(markup["inline_keyboard"][0]), 2)
 
+    def test_student_submenu_is_vertical_despite_saved_width(self):
+        with patch.object(bot, "get_setting_int", return_value=4):
+            markup = bot.make_keyboard([
+                ("section", "s1"), ("resource", "https://example.com", True),
+                ("home", "menu")
+            ])
+        self.assertEqual([len(row) for row in markup["inline_keyboard"]], [1, 1, 1])
+        self.assertEqual(markup["inline_keyboard"][1][0]["url"], "https://example.com")
+
+    def test_student_main_menu_is_vertical(self):
+        with patch.object(bot, "api") as api, \
+                patch.object(bot, "child_sections", return_value=[(1, "section", None)]), \
+                patch.object(bot, "get_setting", return_value="1"), \
+                patch.object(bot, "get_setting_int", return_value=4), \
+                patch.object(bot, "is_admin", return_value=False), \
+                patch.object(bot.identity, "discount_sections", return_value=[]):
+            bot.show_menu(10)
+        rows = api.call_args.kwargs["reply_markup"]["inline_keyboard"]
+        self.assertGreater(len(rows), 1)
+        self.assertTrue(all(len(row) == 1 for row in rows))
+
     def test_admin_command_removes_legacy_reply_keyboard(self):
         with patch.object(bot, "has_access", return_value=True), \
                 patch.object(bot, "is_admin", return_value=True), \
