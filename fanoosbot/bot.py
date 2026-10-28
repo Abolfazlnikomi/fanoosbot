@@ -588,7 +588,7 @@ def show_menu(chat_id, message_id=None, greet=False, name=None):
     btns += [(title, f"discount:{identifier}") for identifier, title, active in identity.discount_sections()]
     if is_admin(chat_id):
         btns.append(("🛠 پنل مدیریت", "a:panel"))
-    kb = make_keyboard(btns)
+    kb = make_keyboard(btns, row_width=2)
     if message_id:
         edit_message(chat_id, message_id, text, kb)
     else:

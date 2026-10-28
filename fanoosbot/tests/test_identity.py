@@ -90,6 +90,32 @@ class RoutingTests(unittest.TestCase):
         self.bot = importlib.import_module("bot")
         self.bot.STATES.clear()
 
+    def test_main_menu_inline_layout(self):
+        for admin in (False, True):
+            for message_id in (None, 7):
+                with self.subTest(admin=admin, message_id=message_id), \
+                     patch.object(self.bot, "child_sections", return_value=[(1, "راهنما", "")]), \
+                     patch.object(self.bot, "get_setting", side_effect=lambda key, default: "0" if key == "feature_quiz" else default), \
+                     patch.object(identity, "discount_sections", return_value=[(2, "تخفیف", 1)]), \
+                     patch.object(self.bot, "is_admin", return_value=admin), \
+                     patch.object(self.bot, "send_message") as send, \
+                     patch.object(self.bot, "edit_message") as edit:
+                    self.bot.show_menu(42, message_id)
+                    target, unused = (edit, send) if message_id else (send, edit)
+                    target.assert_called_once()
+                    unused.assert_not_called()
+                    markup = target.call_args.args[-1]
+                    self.assertEqual(set(markup), {"inline_keyboard"})
+                    rows = markup["inline_keyboard"]
+                    self.assertTrue(all(len(row) == 2 for row in rows[:-1]))
+                    self.assertIn(len(rows[-1]), (1, 2))
+                    callbacks = [button["callback_data"] for row in rows for button in row]
+                    self.assertIn("s1", callbacks)
+                    self.assertIn("discount:2", callbacks)
+                    self.assertIn("sched", callbacks)
+                    self.assertNotIn("quiz", callbacks)
+                    self.assertEqual("a:panel" in callbacks, admin)
+
     def test_start_requires_identity(self):
         with patch.object(self.bot, "has_access", return_value=False), \
              patch.object(self.bot, "send_message") as send, \
