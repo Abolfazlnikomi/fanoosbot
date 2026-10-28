@@ -78,10 +78,14 @@ def api(method, retries=2, **payload):
 
 def send_message(chat_id, text, reply_markup=None):
     """ارسال پیام متنی ساده (بدون parse_mode برای جلوگیری از خطای 400)."""
+    if reply_markup is None and chat_id in STATES:
+        reply_markup = make_keyboard([("✖️ انصراف", "cancel")], row_width=1)
     return api("sendMessage", chat_id=chat_id, text=text, reply_markup=reply_markup)
 
 def edit_message(chat_id, message_id, text, reply_markup=None):
     """ویرایش پیام موجود؛ اگر ممکن نبود پیام جدید می‌فرستد."""
+    if message_id is None:
+        return send_message(chat_id, text, reply_markup)
     r = api("editMessageText", chat_id=chat_id, message_id=message_id,
             text=text, reply_markup=reply_markup)
     if not (r and r.get("ok")):
@@ -289,7 +293,7 @@ def send_workbook(chat_id, content, filename):
         send_message(chat_id, "ارسال فایل ناموفق بود؛ دوباره تلاش کنید.")
 
 
-def handle_identity_callback(chat_id, data):
+def handle_identity_callback(chat_id, data, message_id=None):
     if not is_admin(chat_id):
         return
     STATES.pop(chat_id, None)
@@ -303,10 +307,11 @@ def handle_identity_callback(chat_id, data):
     elif data == "a:identity:reports":
         rows = q("""SELECT created_at, inserted, updated FROM identity_imports
             ORDER BY id DESC LIMIT 10""", fetch="all")
-        send_message(chat_id, "\n".join(f"{date}: ثبت {inserted}، به‌روزرسانی {updated}، خطا ۰"
-                                      for date, inserted, updated in rows) or "گزارشی ثبت نشده است.")
+        edit_message(chat_id, message_id, "\n".join(f"{date}: ثبت {inserted}، به‌روزرسانی {updated}، خطا ۰"
+                                      for date, inserted, updated in rows) or "گزارشی ثبت نشده است.",
+                     make_keyboard([("◀️ مدیریت کاربران", "a:identity")]))
     else:
-        send_message(chat_id, "احراز هویت و مدیریت کاربران", make_keyboard([
+        edit_message(chat_id, message_id, "احراز هویت و مدیریت کاربران", make_keyboard([
             ("دانلود قالب اکسل", "a:identity:template"),
             ("دانلود کاربران فعلی", "a:identity:export"),
             ("بارگذاری اکسل", "a:identity:upload"),
@@ -355,7 +360,7 @@ def receive_identity_file(chat_id, document):
         send_message(chat_id, f"ثبت: {inserted} | به‌روزرسانی: {updated} | خطا: ۰")
 
 
-def discounts_admin_panel(chat_id, section_id=None):
+def discounts_admin_panel(chat_id, section_id=None, message_id=None):
     if not is_admin(chat_id):
         return
     sections = identity.discount_sections(include_inactive=True)
@@ -363,23 +368,27 @@ def discounts_admin_panel(chat_id, section_id=None):
         buttons = [(title + (" (غیرفعال)" if not active else ""), f"a:discounts:open:{identifier}")
                    for identifier, title, active in sections]
         buttons += [("ایجاد بخش تخفیف", "a:discounts:add"), ("بازگشت", "a:panel")]
-        send_message(chat_id, "مدیریت بخش‌های تخفیف", make_keyboard(buttons))
+        edit_message(chat_id, message_id, "مدیریت بخش‌های تخفیف", make_keyboard(buttons))
         return
     section = next((row for row in sections if row[0] == section_id), None)
     if not section:
         send_message(chat_id, "بخش تخفیف یافت نشد.")
         return
-    send_message(chat_id, section[1], make_keyboard([
+    markup = make_keyboard([
         ("تغییر نام نمایشی", f"a:discounts:rename:{section_id}"),
         ("غیرفعال کردن" if section[2] else "فعال کردن", f"a:discounts:toggle:{section_id}"),
         ("دانلود قالب کدها", f"a:discounts:template:{section_id}"),
         ("دانلود کدهای فعلی", f"a:discounts:export:{section_id}"),
         ("بارگذاری کدهای این بخش", f"a:discounts:upload:{section_id}"),
         ("بازگشت", "a:discounts"),
-    ]))
+    ])
+    if message_id:
+        edit_message(chat_id, message_id, section[1], markup)
+    else:
+        send_message(chat_id, section[1], markup)
 
 
-def handle_discounts_callback(chat_id, data):
+def handle_discounts_callback(chat_id, data, message_id=None):
     if not is_admin(chat_id):
         return
     STATES.pop(chat_id, None)
@@ -390,7 +399,7 @@ def handle_discounts_callback(chat_id, data):
         send_message(chat_id, "نام بخش تخفیف جدید را ارسال کنید. انصراف: /cancel")
         return
     if len(parts) != 4 or not parts[3].isdigit():
-        discounts_admin_panel(chat_id)
+        discounts_admin_panel(chat_id, message_id=message_id)
         return
     section_id = int(parts[3])
     if not any(row[0] == section_id for row in identity.discount_sections(include_inactive=True)):
@@ -401,7 +410,7 @@ def handle_discounts_callback(chat_id, data):
         send_message(chat_id, "نام نمایشی جدید را ارسال کنید. انصراف: /cancel")
     elif action == "toggle":
         identity.toggle_discount_section(section_id)
-        discounts_admin_panel(chat_id, section_id)
+        discounts_admin_panel(chat_id, section_id, message_id)
     elif action == "template":
         send_workbook(chat_id, identity.workbook_bytes(headers=identity.DISCOUNT_HEADERS), "discount-template.xlsx")
     elif action == "export":
@@ -410,7 +419,7 @@ def handle_discounts_callback(chat_id, data):
         STATES[chat_id] = ["discount_upload", section_id]
         send_message(chat_id, "فایل xlsx دو ستونی کد ملی و کد تخفیف اختصاصی این بخش را بفرستید. انصراف: /cancel")
     else:
-        discounts_admin_panel(chat_id, section_id)
+        discounts_admin_panel(chat_id, section_id, message_id)
 
 def get_admins():
     return q("SELECT chat_id, name FROM admins ORDER BY chat_id", fetch="all")
@@ -606,7 +615,7 @@ def tree_text(parent_id=None, depth=0):
     return lines
 
 # ================== پنل مدیریت ==================
-def admin_panel(chat_id):
+def admin_panel(chat_id, message_id=None):
     """منوی اصلی پنل مدیریت."""
     if not is_admin(chat_id):
         return
@@ -622,7 +631,10 @@ def admin_panel(chat_id):
         ("مدیریت بخش‌های تخفیف", "a:discounts"),
         ("🏠 منوی اصلی", "menu"),
     ])
-    send_message(chat_id, "🛠 پنل مدیریت مدرسه فانوس\nیک گزینه انتخاب کن:", kb)
+    if message_id:
+        edit_message(chat_id, message_id, "🛠 پنل مدیریت مدرسه فانوس\nیک گزینه انتخاب کن:", kb)
+    else:
+        send_message(chat_id, "🛠 پنل مدیریت مدرسه فانوس\nیک گزینه انتخاب کن:", kb)
 
 def section_admin_buttons():
     """دکمه‌های مدیریت بخش‌ها (شامل مخفی‌ها)."""
@@ -700,6 +712,8 @@ def delete_section_cascade(sid):
 
 def admins_panel(chat_id, message_id=None):
     """مدیریت ادمین‌ها — فقط مالک."""
+    if not is_admin(chat_id):
+        return
     rows = get_admins()
     text = "👥 ادمین‌های ربات:\n" + "\n".join(
         f"• {name} ({cid})" + (" 👑 مالک" if cid == OWNER_ID else "") for cid, name in rows)
@@ -1095,6 +1109,19 @@ def handle_callback(chat_id, data, callback_id, message_id, first_name):
         return
     answer_callback(callback_id)
 
+    if data == "cancel":
+        state = STATES.pop(chat_id, None)
+        if is_admin(chat_id):
+            if state and state[0] == "identity_upload":
+                handle_identity_callback(chat_id, "a:identity", message_id)
+            elif state and state[0] in ("discount_add", "discount_rename", "discount_upload"):
+                discounts_admin_panel(chat_id, message_id=message_id)
+            else:
+                admin_panel(chat_id, message_id)
+        else:
+            show_menu(chat_id, message_id)
+        return
+
     if data == "discount" or data.startswith("discount:"):
         section_id = None if data == "discount" else safe_int(data.split(":", 1)[1])
         account = identity.personal_discount(chat_id, section_id) if data == "discount" or section_id is not None else None
@@ -1104,10 +1131,10 @@ def handle_callback(chat_id, data, callback_id, message_id, first_name):
             send_message(chat_id, f"{account[0]}\n{account[1]}" if account[1] else "برای حساب شما کد تخفیف ثبت نشده است")
         return
     if data == "a:discounts" or data.startswith("a:discounts:"):
-        handle_discounts_callback(chat_id, data)
+        handle_discounts_callback(chat_id, data, message_id)
         return
     if data.startswith("a:identity"):
-        handle_identity_callback(chat_id, data)
+        handle_identity_callback(chat_id, data, message_id)
         return
 
     # --- ناوبری منو ---
@@ -1183,7 +1210,7 @@ def handle_callback(chat_id, data, callback_id, message_id, first_name):
     # --- پنل مدیریت ---
     elif data == "a:panel":
         STATES.pop(chat_id, None)
-        admin_panel(chat_id)
+        admin_panel(chat_id, message_id)
     elif data == "a:features" or data.startswith("a:feature:"):
         if data.startswith("a:feature:"):
             feature = data.split(":", 2)[2]
@@ -1330,13 +1357,21 @@ def handle_callback(chat_id, data, callback_id, message_id, first_name):
         else:
             STATES[chat_id] = ["addadm", None]
             send_message(chat_id, "➕ شناسه عددی (chat_id) ادمین جدید را بفرست:")
-    elif data.startswith("a:rma:"):
+    elif data.startswith(("a:rma:", "a:rmac:")):
         if not is_owner(chat_id):
             send_message(chat_id, "⛔️ فقط مالک می‌تواند ادمین حذف کند.")
         else:
             aid = safe_int(data.split(":")[2])
             if aid == OWNER_ID:
                 send_message(chat_id, "👑 مالک قابل حذف نیست.")
+            elif aid is None:
+                admins_panel(chat_id, message_id)
+                return
+            elif data.startswith("a:rma:"):
+                edit_message(chat_id, message_id, f"دسترسی مدیریت شناسه {aid} حذف شود؟",
+                             make_keyboard([("🗑 تأیید حذف", f"a:rmac:{aid}"),
+                                            ("◀️ انصراف", "a:admins")], row_width=2))
+                return
             else:
                 q("DELETE FROM admins WHERE chat_id=?", (aid,))
                 send_message(chat_id, "🗑 ادمین حذف شد.")
