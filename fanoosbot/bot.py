@@ -50,7 +50,6 @@ PAGE_SIZE = 5                                     # تعداد آیتم در ه�
 
 # وضعیت‌های موقت کاربران: STATES[chat_id] = [نام_وضعیت, داده]
 STATES = {}
-ADMIN_KEYBOARDS = {}
 # محدودسازی نرخ کلیک دکمه: CB_TIMES[chat_id] = آخرین زمان کلیک
 CB_TIMES = {}
 
@@ -81,13 +80,11 @@ def send_message(chat_id, text, reply_markup=None):
     """ارسال پیام متنی ساده (بدون parse_mode برای جلوگیری از خطای 400)."""
     if reply_markup is None and chat_id in STATES:
         reply_markup = make_keyboard([("✖️ انصراف", "cancel")], row_width=1)
-    if is_admin_markup(reply_markup) and is_admin(chat_id):
-        reply_markup = admin_reply_keyboard(chat_id, reply_markup)
     return api("sendMessage", chat_id=chat_id, text=text, reply_markup=reply_markup)
 
 def edit_message(chat_id, message_id, text, reply_markup=None):
     """ویرایش پیام موجود؛ اگر ممکن نبود پیام جدید می‌فرستد."""
-    if message_id is None or is_admin_markup(reply_markup):
+    if message_id is None:
         return send_message(chat_id, text, reply_markup)
     r = api("editMessageText", chat_id=chat_id, message_id=message_id,
             text=text, reply_markup=reply_markup)
@@ -117,24 +114,6 @@ def is_admin_markup(markup):
                    data == "a:supmsg" for data in callbacks)
 
 
-def admin_reply_keyboard(chat_id, markup):
-    actions = {}
-    keyboard = []
-    for row in markup["inline_keyboard"]:
-        keyboard_row = []
-        for button in row:
-            label = button["text"]
-            original_label = label
-            suffix = 2
-            while label in actions:
-                label = f"{original_label} ({suffix})"
-                suffix += 1
-            actions[label] = button["callback_data"]
-            keyboard_row.append({"text": label})
-        keyboard.append(keyboard_row)
-    ADMIN_KEYBOARDS[chat_id] = actions
-    return {"keyboard": keyboard, "resize_keyboard": True, "one_time_keyboard": False}
-
 def make_keyboard(buttons, row_width=None):
     """ساخت کیبورد شیشه‌ای؛ buttons = [(متن, callback_data) یا (متن, callback_data, True) برای لینک]."""
     if row_width is None:
@@ -149,7 +128,10 @@ def make_keyboard(buttons, row_width=None):
             else:
                 row.append({"text": b[0], "callback_data": b[1]})
         kb.append(row)
-    return {"inline_keyboard": kb} if kb else None
+    markup = {"inline_keyboard": kb} if kb else None
+    if is_admin_markup(markup):
+        markup = {"inline_keyboard": [[button] for row in kb for button in row]}
+    return markup
 
 # ================== دیتابیس ==================
 def db():
@@ -614,8 +596,6 @@ def open_section(chat_id, sid, message_id=None):
 
 def show_menu(chat_id, message_id=None, greet=False, name=None):
     """منوی اصلی؛ فقط بار اول (greet=True) خوش‌آمد می‌گوید."""
-    if ADMIN_KEYBOARDS.pop(chat_id, None) is not None:
-        api("sendMessage", chat_id=chat_id, text="🏠 منوی اصلی", reply_markup={"remove_keyboard": True})
     text = "🎓 مدرسه فانوس" if not greet else (
         f"سلام {name} عزیز! 🌸\nبه مدرسه فانوس خوش آمدی! 🎓\n\nاز منوی زیر انتخاب کن:")
     btns = [(f"📄 {t}", escape_cb(f"s{i}")) for (i, t, u) in child_sections(None)]
@@ -1667,9 +1647,6 @@ def handle_message(chat_id, text, first_name, message_id=None):
     """پردازش پیام‌ها: دستورها، حالت‌های ادمین، و پیش‌فرض (منو بدون سلام)."""
     if not has_access(chat_id):
         STATES.pop(chat_id, None)
-        if ADMIN_KEYBOARDS.pop(chat_id, None) is not None:
-            api("sendMessage", chat_id=chat_id, text="⛔️ دسترسی مدیریت ندارید.",
-                reply_markup={"remove_keyboard": True})
         if text.startswith("/"):
             send_message(chat_id, "لطفاً کد ملی خود را وارد کنید")
         elif identity.bind(chat_id, identity.normalize(text)):
@@ -1679,17 +1656,6 @@ def handle_message(chat_id, text, first_name, message_id=None):
             send_message(chat_id, "شما به این بات دسترسی ندارید")
         return
     register_user(chat_id, first_name)
-
-    if chat_id in ADMIN_KEYBOARDS:
-        if not is_admin(chat_id):
-            ADMIN_KEYBOARDS.pop(chat_id, None)
-            api("sendMessage", chat_id=chat_id, text="⛔️ دسترسی مدیریت ندارید.",
-                reply_markup={"remove_keyboard": True})
-        else:
-            action = ADMIN_KEYBOARDS[chat_id].get(text)
-            if action:
-                handle_callback(chat_id, action, None, None, first_name)
-                return
 
     if text == "/cancel":
         STATES.pop(chat_id, None)
@@ -1712,6 +1678,8 @@ def handle_message(chat_id, text, first_name, message_id=None):
     elif text == "/admin":
         if is_admin(chat_id):
             STATES.pop(chat_id, None)
+            api("sendMessage", chat_id=chat_id, text="🛠 ورود به پنل مدیریت",
+                reply_markup={"remove_keyboard": True})
             admin_panel(chat_id)
         else:
             send_message(chat_id, "⛔️ دسترسی ندارید.")
